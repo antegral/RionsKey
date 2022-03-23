@@ -1,5 +1,5 @@
 {
-  "include": ["index.ts", "src/**/*"],
+  "include": ["index.ts", "example.ts", "src/**/*"],
   "exclude": ["node_modules", "dist", "build"],
 
   "compilerOptions": {
