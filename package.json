@@ -2,7 +2,7 @@
   "name": "rionskey",
   "version": "1.0.0",
   "license": "MIT",
-  "description": "simple TransKey wrapper library",
+  "description": "Simple TransKey wrapper library",
   "keywords": [
     "RIonskey",
     "TransKey"
