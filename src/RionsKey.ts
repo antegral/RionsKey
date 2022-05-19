@@ -8,25 +8,29 @@ import {
 } from '@babel/types';
 
 import got from 'got';
-import crypto from 'crypto';
+import { randomBytes, randomFillSync } from 'crypto';
 import { parse } from '@babel/parser';
 import rionsKeyEncLib from 'rionskey-seed';
 import CryptoJS from 'crypto-js';
+import { X509 } from 'jsrsasign';
+import NodeRSA from 'node-rsa';
 
 export default class RionsKey extends rionsKeyEncLib {
   private KeySet: NumpadKeymaps;
   private tkUrl: URL;
   private tkEnv: tkParams;
   private tkKeyboardType: 'number';
-  private sessionId: string;
+  private tkHmac: string;
+  private tkPKey: string[];
+  private sessionKey: string;
+  private certPubkey: string;
   private iv: number[];
   private keyIndex: string;
   private uuid: string;
   private allocationIndex: number;
   private isDebugMode: boolean;
-  private pubKey: string;
 
-  constructor(keySet: NumpadKeymaps, transkeyServlet: URL, iv: number[], isDebugMode?: boolean) {
+  constructor(keySet: NumpadKeymaps, transkeyServlet: URL, iv?: number[], isDebugMode?: boolean) {
     super();
     this.KeySet = keySet;
     this.tkUrl = transkeyServlet;
@@ -46,16 +50,15 @@ export default class RionsKey extends rionsKeyEncLib {
       java_ver: 1.8,
     };
     isDebugMode ? (this.isDebugMode = true) : (this.isDebugMode = false);
-    this.uuid = crypto.randomBytes(32).toString('hex');
-    this.allocationIndex = parseInt(crypto.randomBytes(32).toString('hex').substring(0, 8), 16);
-    this.sessionId = crypto.randomBytes(32).toString('hex').substring(0, 16);
+    this.uuid = randomBytes(32).toString('hex');
+    this.allocationIndex = parseInt(randomBytes(32).toString('hex').substring(0, 8), 16);
+    this.sessionKey = randomBytes(32).toString('hex').substring(0, 16);
   }
   async createSession(keyboardType: 'number') {
     this.tkKeyboardType = keyboardType;
-    return this.getTkParams().then(async () => {
-      await this.getPublicKey();
-      await this.getKeyIndex(this.tkKeyboardType);
-    });
+    await this.getTkParams();
+    await this.getPublicKey();
+    await this.getKeyIndex(this.tkKeyboardType);
   }
 
   async getTkParams() {
@@ -114,6 +117,15 @@ export default class RionsKey extends rionsKeyEncLib {
       });
   }
 
+  parsePKeyParams() {
+    this.tkPKey = [
+      this.certPubkey.substring(64, this.certPubkey.length - 10),
+      this.certPubkey.substring(this.certPubkey.length - 6, this.certPubkey.length),
+    ];
+
+    return this.tkPKey;
+  }
+
   async getPublicKey() {
     return await got
       .get(this.tkUrl, {
@@ -122,17 +134,10 @@ export default class RionsKey extends rionsKeyEncLib {
         },
       })
       .then((res) => {
-        this.pubKey = res.body;
-        this.isDebugMode
-          ? console.log(
-              `getPublicKey >> OK, is ${
-                res.body.length === 1152
-                  ? 'Vaild data (1152)'
-                  : `INVAILD DATA! (${res.body.length})`
-              }`,
-            )
-          : null;
-        return this.pubKey;
+        let cert = new X509();
+        cert.readCertPEM(`-----BEGIN CERTIFICATE-----${res.body}-----END CERTIFICATE-----`);
+        this.certPubkey = this.tkEnv.useGenKey ? res.body.split('$')[0] : cert.getSPKI();
+        return this.certPubkey;
       })
       .catch((err) => {
         throw new Error(err);
@@ -301,7 +306,7 @@ export default class RionsKey extends rionsKeyEncLib {
 
     while (i < length) {
       // Filling Empty Space from Random Bytes.
-      result[i] = parseInt(crypto.randomBytes(32).toString('hex').substring(0, 8), 16) % 100;
+      result[i] = parseInt(randomBytes(32).toString('hex').substring(0, 8), 16) % 100;
       i++;
     }
     return result;
@@ -309,9 +314,8 @@ export default class RionsKey extends rionsKeyEncLib {
 
   encrypt(SeletedButtons: Button[]) {
     let maxLength =
-      SeletedButtons.length +
-      (parseInt(crypto.randomBytes(32).toString('hex').substring(0, 8), 16) % 10);
-    let encryptedString: string = '';
+      SeletedButtons.length + (parseInt(randomBytes(32).toString('hex').substring(0, 8), 16) % 10);
+    let EncryptedString: string = '';
 
     // First, encrypt the buttons.
     for (let button of SeletedButtons) {
@@ -321,7 +325,7 @@ export default class RionsKey extends rionsKeyEncLib {
       let encrypted = this.cbcEncrypt(TkInputable, this.iv, roundKey, 48);
 
       // push encrypted data (hex string)
-      encryptedString = encryptedString.concat(this.getHexString(encrypted));
+      EncryptedString = EncryptedString.concat(this.hexStringify(encrypted));
     }
 
     // Second, fillin the empty space. (repeat encrypt string '# 0 0')
@@ -332,29 +336,64 @@ export default class RionsKey extends rionsKeyEncLib {
       let encrypted = this.cbcEncrypt(TkInputable, this.iv, roundKey, 48);
 
       // push encrypted data (hex string)
-      encryptedString = encryptedString.concat(this.getHexString(encrypted));
+      EncryptedString = EncryptedString.concat(this.hexStringify(encrypted));
     }
 
-    return encryptedString;
+    return EncryptedString;
   }
 
-  sendData(encryptedString: number[]) {
-    let encString = this.getHexString([...encryptedString]);
-    let hmac: string;
-
+  getFormattedData(EncryptedString: string) {
     this.tkEnv.java_ver < 1.5
-      ? (hmac = CryptoJS.HmacSHA1(encString, this.sessionId).toString(CryptoJS.enc.Utf8))
-      : (hmac = CryptoJS.HmacSHA256(encString, this.sessionId).toString(CryptoJS.enc.Utf8));
+      ? (this.tkHmac = CryptoJS.HmacSHA1(EncryptedString, this.sessionKey).toString())
+      : (this.tkHmac = CryptoJS.HmacSHA256(EncryptedString, this.sessionKey).toString());
+
+    return `{\\"raon\\":[{\\"id\\":\\"password\\",\\"enc\\":\\${EncryptedString}\\",\\"hmac\\":\\"${
+      this.tkHmac
+    }\\",\\"keyboardType\\":\\"${this.tkKeyboardType}\\",\\"keyIndex\\":\\"${
+      this.keyIndex
+    }\\",\\"fieldType\\":\\"password\\",\\"seedKey\\":\\"${this.getEncSessionKey()}\\",\\"initTime\\":\\"${
+      this.tkEnv.initTime
+    }\\",\\"ExE2E\\":\\"false\\"}]}`;
   }
 
-  getHexString(data: number[]) {
-    let dataString = Buffer.from(data).toString('hex');
-    let dataArray: string[] = [];
-    for (let i = 0; i < dataString.length; i++) {
-      let now = dataString.substring(i++, i + 1);
-      now.startsWith('0') ? dataArray.push(now.charAt(1)) : dataArray.push(now);
+  hexStringify(data: number[]) {
+    let DataString = Buffer.from(data).toString('hex');
+    let DataArray: string[] = [];
+    for (let i = 0; i < DataString.length; i++) {
+      let now = DataString.substring(i++, i + 1);
+      now.startsWith('0') ? DataArray.push(now.charAt(1)) : DataArray.push(now);
     }
-    return `$${dataArray.join(',')}`;
+    return `$${DataArray.join(',')}`;
+  }
+
+  getEncSessionKey() {
+    this.parsePKeyParams();
+    let rsa = new NodeRSA();
+
+    let _e = this.conv16Bit(this.tkPKey[1]);
+
+    rsa.importKey(
+      {
+        n: Buffer.from(this.tkPKey[0], 'hex'),
+        e: typeof _e === 'number' ? _e : 65537, // Expected value: 65537
+      },
+      'components-public',
+    );
+    return rsa.encrypt(this.sessionKey).toString('hex');
+  }
+
+  conv16Bit(plain: string) {
+    if (plain.length <= 8) {
+      return parseInt(plain, 16);
+    } else {
+      let result = [];
+      for (let i = 0; i < plain.length / 7; i++) {
+        let start = plain.length - i * 7 - 7 ? plain.length - i * 7 - 7 : 0;
+        let end = plain.length - i * 7;
+        result.push(parseInt(plain.substring(start, end), 16));
+      }
+      return result;
+    }
   }
 
   private checkReqEnv(originalUrl?: string) {
